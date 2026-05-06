@@ -272,6 +272,16 @@ export const WebGLCanvas = ({
           cursor: phase === "IDLE" ? "crosshair" : "none",
         }}
         onPointerDown={handlePointerDown}
+        onPointerMove={
+          phase === "IDLE"
+            ? (e) => onMouseMove(e as unknown as React.MouseEvent)
+            : undefined
+        }
+        onPointerUp={
+          phase === "IDLE"
+            ? (e) => onMouseUp(e as unknown as React.MouseEvent)
+            : undefined
+        }
       />
 
       {/* Minimal overlays — only flash + void */}
