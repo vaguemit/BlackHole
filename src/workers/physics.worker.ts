@@ -9,8 +9,8 @@ interface WorkerInitialData {
   spin: number;
 }
 
-// State
-let engine: import("blackhole-physics").PhysicsEngine | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let engine: any = null;
 let sab: SharedArrayBuffer | null = null;
 let lastTickTime = 0;
 
@@ -57,7 +57,9 @@ self.onmessage = async (e: MessageEvent) => {
     sabSequenceView = new Int32Array(sab);
 
     try {
-      const wasmModuleWrap = await import("blackhole-physics");
+      const wasmModuleWrap = await import(
+        /* webpackIgnore: true */ "blackhole-physics"
+      );
       const wasmModule = await wasmModuleWrap.default();
       const { PhysicsEngine, init_hooks } = wasmModuleWrap;
 

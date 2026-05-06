@@ -74,7 +74,9 @@ export class PhysicsBridge {
         // eslint-disable-next-line no-console
         console.error("PhysicsBridge Fallback: Loading in main thread...", err);
         // Fallback for environments where workers or SAB are disabled
-        const wasmModuleWrap = await import("blackhole-physics");
+        const wasmModuleWrap = await import(
+          /* webpackIgnore: true */ "blackhole-physics"
+        );
         const wasmModule = await wasmModuleWrap.default();
         this.wasmMemory = wasmModule.memory;
         this.engine = new wasmModuleWrap.PhysicsEngine(1.0, 0.9);
