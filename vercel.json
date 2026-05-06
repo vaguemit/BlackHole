@@ -1,18 +1,7 @@
 {
-  "github": {
-    "enabled": false,
-    "silent": true
-  },
-  "crons": [],
   "cleanUrls": true,
   "trailingSlash": false,
   "framework": "nextjs",
-  "buildCommand": "bun run build:vercel",
-  "installCommand": "bun install",
-  "build": {
-    "env": {
-      "CARGO_BUILD_JOBS": "1",
-      "RUSTFLAGS": "-C target-feature=+bulk-memory"
-    }
-  }
+  "buildCommand": "next build",
+  "installCommand": "npm install"
 }
