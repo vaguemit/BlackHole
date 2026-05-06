@@ -21,7 +21,7 @@
     "seo:ping": "bun scripts/indexnow-ping.ts",
     "shader:check": "vitest run --config vitest.shader.config.ts",
     "shader:update-goldens": "bun scripts/update-goldens.ts",
-    "postinstall": "lefthook install",
+    "postinstall": "node -e \"if(require('fs').existsSync('.git')) { require('child_process').execSync('lefthook install', {stdio:'inherit'}) }\"",
     "clean": "rimraf .next node_modules physics-engine/target physics-engine/gravitas-wasm/pkg physics-engine/gravitas-core/target public/wasm"
   },
   "dependencies": {
