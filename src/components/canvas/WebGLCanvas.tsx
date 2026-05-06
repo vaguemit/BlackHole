@@ -135,13 +135,9 @@ export const WebGLCanvas = ({
         try {
           rendererRef.current?.render(paramsRef.current, mouseRef.current);
         } catch (e) {
-          const err = e as Error;
-          setError({
-            type: "shader",
-            message: err.message,
-            details: err.stack,
-          });
-          return;
+          // Log but don't kill the loop — transient GL errors shouldn't freeze the disk
+          // eslint-disable-next-line no-console
+          console.warn("Render error (non-fatal):", e);
         }
       }
       rafRef.current = requestAnimationFrame(loop);
@@ -218,7 +214,7 @@ export const WebGLCanvas = ({
       const dx = e.clientX - cx;
       const dy = e.clientY - cy;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      const hitRadius = Math.min(rect.width, rect.height) * 0.08;
+      const hitRadius = Math.min(rect.width, rect.height) * 0.05;
 
       if (dist <= hitRadius) {
         e.preventDefault();
@@ -232,9 +228,9 @@ export const WebGLCanvas = ({
 
   const horizonRadius = (() => {
     const canvas = canvasRef.current;
-    if (!canvas) return 40;
+    if (!canvas) return 25;
     const r = canvas.getBoundingClientRect();
-    return Math.min(r.width, r.height) * 0.08;
+    return Math.min(r.width, r.height) * 0.05;
   })();
 
   return (
