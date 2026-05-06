@@ -218,7 +218,7 @@ export const WebGLCanvas = ({
       const dx = e.clientX - cx;
       const dy = e.clientY - cy;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      const hitRadius = Math.min(rect.width, rect.height) * 0.18;
+      const hitRadius = Math.min(rect.width, rect.height) * 0.08;
 
       if (dist <= hitRadius) {
         e.preventDefault();
@@ -232,9 +232,9 @@ export const WebGLCanvas = ({
 
   const horizonRadius = (() => {
     const canvas = canvasRef.current;
-    if (!canvas) return 80;
+    if (!canvas) return 40;
     const r = canvas.getBoundingClientRect();
-    return Math.min(r.width, r.height) * 0.18;
+    return Math.min(r.width, r.height) * 0.08;
   })();
 
   return (
