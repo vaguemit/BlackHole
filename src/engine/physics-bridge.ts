@@ -1,0 +1,416 @@
+export { OFFSETS, BLOCK_FLOATS, TELEMETRY_SLOTS } from "./sab-schema";
+import { OFFSETS } from "./sab-schema";
+
+export class PhysicsBridge {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private engine: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private wasmModule: any = null;
+  private worker: Worker | null = null;
+  private workerReady = false; // BUG FIX: Only true after WASM loads inside worker
+  private initializationPromise: Promise<void> | null = null;
+  private currentMass = 1.0;
+  private currentSpin = 0.0;
+  private lastBuffer: ArrayBuffer | SharedArrayBuffer | null = null;
+  private sab: SharedArrayBuffer | null = null;
+  private _lastGoodCamera = new Float32Array(64);
+  private _lastGoodPhysics = new Float32Array(256); // Expanded for shadow curve (128 used)
+
+  // Persistent views
+  private controlView: Float32Array = new Float32Array(0);
+  private cameraView: Float32Array = new Float32Array(0);
+  private physicsView: Float32Array = new Float32Array(0);
+
+  // Fallback views (Map to WASM memory directly)
+  private wasmMemory: WebAssembly.Memory | null = null;
+  private wasmControlView: Float32Array = new Float32Array(0);
+  private wasmCameraView: Float32Array = new Float32Array(0);
+  private wasmPhysicsView: Float32Array = new Float32Array(0);
+
+  // Cached Int32Array view for Atomics (avoids per-frame allocation)
+  private seqView: Int32Array | null = null;
+  private lastSeenSequence: number = -1;
+
+  public async initialize(): Promise<void> {
+    if (this.initializationPromise) return this.initializationPromise;
+
+    this.initializationPromise = (async () => {
+      try {
+        // eslint-disable-next-line no-console
+        console.log("PhysicsBridge: Initializing WASM Kernel...");
+
+        // Note: In Next.js, we need to handle both SSR and Client-side loading.
+        // The worker is the primary driver in production.
+        this.worker = new Worker(
+          new URL("../workers/physics.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+
+        // Setup SharedArrayBuffer (SAB) for Zero-Copy Sync
+        // 2MB is enough for headers + several 512x512 LUTs
+        this.sab = new SharedArrayBuffer(2 * 1024 * 1024);
+        this.initializeViews();
+
+        // BUG FIX: Must send mass and spin, otherwise Rust receives NaN
+        this.worker.postMessage({
+          type: "INIT",
+          data: { sab: this.sab, mass: 1.0, spin: 0.9 },
+        });
+
+        return new Promise<void>((resolve, reject) => {
+          if (!this.worker) return reject("Worker failed to init");
+          this.worker.onmessage = (e) => {
+            if (e.data.type === "READY") {
+              // eslint-disable-next-line no-console
+              console.log("PhysicsBridge: Worker Ready.");
+              this.workerReady = true;
+              resolve();
+            } else if (e.data.type === "ERROR") {
+              reject(e.data.error);
+            }
+          };
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("PhysicsBridge Fallback: Loading in main thread...", err);
+        // Fallback for environments where workers or SAB are disabled
+        const wasmModuleWrap = await import("blackhole-physics");
+        const wasmModule = await wasmModuleWrap.default();
+        this.wasmMemory = wasmModule.memory;
+        this.engine = new wasmModuleWrap.PhysicsEngine(1.0, 0.9);
+        this.initializeFallbackViews();
+      }
+    })();
+
+    return this.initializationPromise;
+  }
+
+  private initializeViews() {
+    if (!this.sab) return;
+    this.controlView = new Float32Array(this.sab, OFFSETS.CONTROL * 4, 16);
+    this.cameraView = new Float32Array(this.sab, OFFSETS.CAMERA * 4, 64);
+    this.physicsView = new Float32Array(this.sab, OFFSETS.PHYSICS * 4, 128);
+    this.seqView = new Int32Array(this.sab);
+  }
+
+  private initializeFallbackViews() {
+    if (!this.engine || !this.wasmMemory) return;
+    const ptr = this.engine.get_sab_ptr();
+    this.wasmControlView = new Float32Array(
+      this.wasmMemory.buffer,
+      ptr + OFFSETS.CONTROL * 4,
+      16,
+    );
+    this.wasmCameraView = new Float32Array(
+      this.wasmMemory.buffer,
+      ptr + OFFSETS.CAMERA * 4,
+      16,
+    );
+    this.wasmPhysicsView = new Float32Array(
+      this.wasmMemory.buffer,
+      ptr + OFFSETS.PHYSICS * 4,
+      128,
+    );
+  }
+
+  public isReady(): boolean {
+    // BUG FIX: Previously returned !!(this.engine || this.worker), which was
+    // true immediately after Worker() constructor -- before WASM loaded.
+    // Now we wait for the actual READY ack from the worker.
+    return !!(this.engine || this.workerReady);
+  }
+
+  /**
+   * Wire `document.visibilitychange` so the worker drops to its idle
+   * loop when the tab is hidden and resumes 75 Hz on focus. Without
+   * this, the worker keeps full pace in background tabs and burns
+   * battery on mobile.
+   *
+   * Returns a teardown function the caller invokes on unmount.
+   */
+  public attachVisibilityListener(): () => void {
+    if (typeof document === "undefined") return () => {};
+    const handler = () => {
+      if (!this.worker) return;
+      this.worker.postMessage({
+        type: "VISIBILITY",
+        data: { hidden: document.visibilityState === "hidden" },
+      });
+    };
+    document.addEventListener("visibilitychange", handler);
+    handler(); // sync initial state
+    return () => document.removeEventListener("visibilitychange", handler);
+  }
+
+  public async ensureInitialized(): Promise<void> {
+    if (!this.initializationPromise) {
+      return this.initialize();
+    }
+    return this.initializationPromise;
+  }
+
+  /**
+   * Primary Telemetry Hook. Reads camera and physics state from SAB.
+   * This is called 60+ times per second in the animation loop.
+   *
+   * MEMORY LAYOUT REMINDER:
+   *   OFFSETS are f32 element indices.  Int32Array also uses 4-byte elements,
+   *   so the element index into Int32Array is the SAME as the f32 index.
+   *   DO NOT divide by 4 -- that was the original Bug #2.
+   */
+  public tick(
+    dt: number,
+  ): { camera: Float32Array; physics: Float32Array } | null {
+    if (this.worker && this.sab && this.seqView) {
+      // 1. Write the current frame delta to the shared control block
+      this.controlView[4] = dt;
+
+      // 2. CONSISTENCY CHECK (Anti-Tearing)
+      const seq1 = Atomics.load(this.seqView, OFFSETS.TELEMETRY);
+
+      // Fast path: if sequence hasn't changed since last read, data is the same.
+      // Skip the expensive .set() copy entirely.
+      if (seq1 === this.lastSeenSequence) {
+        return { camera: this._lastGoodCamera, physics: this._lastGoodPhysics };
+      }
+
+      const camera = this.cameraView;
+      const physics = this.physicsView;
+
+      const seq2 = Atomics.load(this.seqView, OFFSETS.TELEMETRY);
+      if (seq1 !== seq2) {
+        // Data might be torn. Return last good state.
+        return { camera: this._lastGoodCamera, physics: this._lastGoodPhysics };
+      }
+
+      // NaN Guard: If the physics engine produced garbage, don't propagate it
+      if (
+        !Number.isFinite(camera[0]) ||
+        !Number.isFinite(camera[1]) ||
+        !Number.isFinite(camera[2])
+      ) {
+        return { camera: this._lastGoodCamera, physics: this._lastGoodPhysics };
+      }
+
+      // Update shadowing caches (only when data actually changed)
+      this._lastGoodCamera.set(camera);
+      this._lastGoodPhysics.set(physics);
+      this.lastSeenSequence = seq1;
+
+      return { camera: this._lastGoodCamera, physics: this._lastGoodPhysics };
+    }
+
+    if (this.isReady() && this.engine) {
+      // Main Thread Fallback path
+      this.engine.tick_sab(dt);
+
+      // Update shadowing caches from WASM memory
+      this._lastGoodCamera.set(this.wasmCameraView);
+      this._lastGoodPhysics.set(this.wasmPhysicsView);
+
+      return { camera: this._lastGoodCamera, physics: this._lastGoodPhysics };
+    }
+    return null;
+  }
+
+  public updateParameters(mass: number, spin: number) {
+    this.currentMass = mass;
+    this.currentSpin = spin;
+
+    if (this.worker) {
+      this.worker.postMessage({ type: "UPDATE_PARAMS", data: { mass, spin } });
+    }
+
+    if (this.engine) {
+      this.engine.update_params(mass, spin);
+    }
+  }
+
+  public setCameraState(
+    pos: { x: number; y: number; z: number },
+    lookAt: { x: number; y: number; z: number },
+  ) {
+    if (this.worker) {
+      this.worker.postMessage({
+        type: "SET_CAMERA_STATE",
+        data: { pos, lookAt },
+      });
+    }
+    if (this.engine) {
+      this.engine.set_camera_state(
+        pos.x,
+        pos.y,
+        pos.z,
+        lookAt.x,
+        lookAt.y,
+        lookAt.z,
+      );
+    }
+  }
+
+  public setAutoSpin(enabled: boolean) {
+    if (this.worker) {
+      this.worker.postMessage({ type: "SET_AUTO_SPIN", data: enabled });
+    }
+    if (this.engine) {
+      this.engine.set_auto_spin(enabled);
+    }
+  }
+
+  public updateInputs(inputs: {
+    dt: number;
+    orbitX: number;
+    orbitY: number;
+    zoom: number;
+  }) {
+    if (this.worker) {
+      this.worker.postMessage({ type: "UPDATE_INPUTS", data: inputs });
+    }
+    // Shared memory handles the actual update if using SAB, but we still trigger logic
+  }
+
+  public getDiskLUT(): Float32Array | null {
+    if (!this.engine) return null;
+    return this.engine.generate_disk_lut();
+  }
+
+  public getSpectrumLUT(
+    width: number,
+    height: number,
+    maxTemp: number,
+  ): Float32Array | null {
+    if (!this.engine) return null;
+    return this.engine.generate_spectrum_lut(width, height, maxTemp);
+  }
+
+  public computeHorizon(): number {
+    return this.engine ? this.engine.compute_horizon() : 2.0;
+  }
+
+  public computeISCO(): number {
+    return this.engine ? this.engine.compute_isco() : 6.0;
+  }
+
+  public computePhotonSphere(): number {
+    return this.engine ? this.engine.compute_photon_sphere() : 3.0;
+  }
+
+  public computeDilation(r: number): number {
+    if (this.engine) return this.engine.compute_dilation(r);
+
+    // Fallback: Schwarzschild approximation (r > 2M)
+    const rs = 2.0 * this.currentMass;
+    if (r <= rs) return 100.0;
+    return 1.0 / Math.sqrt(1.0 - rs / r);
+  }
+
+  // =================================================================
+  // SPACETIME VISUALIZATION BRIDGE
+  // These methods expose the Rust physics engine's spacetime/ module
+  // functions that are already compiled into WASM (gravitas-wasm/src/lib.rs)
+  // but were never wired into the frontend.
+  // =================================================================
+
+  /**
+   * FROM spacetime/embedding.rs via gravitas-wasm:
+   * Generates a 3D embedding mesh (Flamm's paraboloid for Schwarzschild,
+   * numerical g_rr integral for Kerr). Returns flat Float32Array of
+   * (x, y, z) triples.
+   */
+  public generateEmbeddingMesh(
+    rMin: number,
+    rMax: number,
+    nRadial: number,
+    nAngular: number,
+  ): Float32Array | null {
+    if (!this.engine) return null;
+    try {
+      return this.engine.generate_embedding_mesh(rMin, rMax, nRadial, nAngular);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * FROM spacetime/frame_drag.rs via gravitas-wasm:
+   * Generates 3D vertices for the ergosphere surface.
+   * The ergosphere is the oblate region where g_tt > 0 (static limit).
+   * Returns flat Float32Array of (x, y, z) triples.
+   */
+  public generateErgosphereMesh(
+    nPolar: number,
+    nAzimuthal: number,
+  ): Float32Array | null {
+    if (!this.engine) return null;
+    try {
+      return this.engine.generate_ergosphere_mesh(nPolar, nAzimuthal);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * FROM physics/shadow.rs via gravitas-wasm:
+   * Computes the exact Bardeen critical curve (shadow boundary) for
+   * a spinning black hole. Returns flat Float32Array of (alpha, beta) pairs.
+   */
+  public computeShadowCurve(
+    thetaObs: number,
+    nPoints: number,
+  ): Float32Array | null {
+    if (!this.engine) return null;
+    try {
+      return this.engine.compute_shadow_curve(thetaObs, nPoints);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * FROM physics/disk.rs via gravitas-wasm:
+   * Page-Thorne flux at radius r (full GR disk flux function).
+   */
+  public computeDiskFlux(r: number): number {
+    if (!this.engine) return 0;
+    try {
+      return this.engine.compute_disk_flux(r);
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * FROM physics/redshift.rs via gravitas-wasm:
+   * Full GR g-factor (Cunningham 1975) for disk emission.
+   */
+  public computeGFactor(r: number, lambda: number): number {
+    if (!this.engine) return 1;
+    try {
+      return this.engine.compute_g_factor(r, lambda);
+    } catch {
+      return 1;
+    }
+  }
+
+  /** Schwarzschild shadow radius (critical impact parameter). */
+  public computeShadowRadius(): number {
+    if (!this.engine) return 3 * Math.sqrt(3) * this.currentMass;
+    try {
+      return this.engine.compute_shadow_radius();
+    } catch {
+      return 3 * Math.sqrt(3) * this.currentMass;
+    }
+  }
+
+  /** Current mass getter for fallback calculations. */
+  public getMass(): number {
+    return this.currentMass;
+  }
+
+  /** Current spin getter for fallback calculations. */
+  public getSpin(): number {
+    return this.currentSpin;
+  }
+}
+
+export const physicsBridge = new PhysicsBridge();

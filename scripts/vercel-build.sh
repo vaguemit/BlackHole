@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Exit on error
+set -e
+
+echo "--- Starting Vercel Build for Blackhole Simulation ---"
+
+# 1. Install Rust if not present
+if ! command -v rustc &> /dev/null; then
+    echo "Rust not found. Installing..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source $HOME/.cargo/env
+else
+    echo "Rust is already installed."
+fi
+
+# Ensure cargo is in PATH
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# 2. Add WASM target
+echo "Adding wasm32-unknown-unknown target..."
+rustup target add wasm32-unknown-unknown
+
+# 3. Install wasm-pack (if binary not found)
+# Note: wasm-pack is also in devDependencies, but we ensure binary is available
+if ! command -v wasm-pack &> /dev/null; then
+    echo "wasm-pack not found. Installing binary..."
+    curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+else
+    echo "wasm-pack is already available."
+fi
+
+# 4. Build the physics engine (gravitas-wasm crate)
+echo "Building WASM physics engine (gravitas-wasm)..."
+cd physics-engine/gravitas-wasm
+# Use single job to prevent OOM in Vercel's build environment
+CARGO_BUILD_JOBS=1 wasm-pack build --target web --out-name blackhole_physics --out-dir ../../public/wasm
+cd ../..
+
+# 6. Run the Next.js build
+echo "Running Next.js build..."
+next build
+
+# 7. IndexNow ping (Bing + Yandex). Logs only, never fails the deploy.
+# Note: on first deploy after this PR, the live sitemap.xml may still reflect
+# the prior deploy until Vercel atomically swaps. After first cycle, lag = 1 deploy.
+echo ""
+echo "--- IndexNow ping (Bing + Yandex) ---"
+bun scripts/indexnow-ping.ts || true
+
+echo "--- Vercel Build Complete ---"

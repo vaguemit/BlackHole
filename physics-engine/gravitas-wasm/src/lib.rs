@@ -1,0 +1,657 @@
+//! gravitas-wasm: WebAssembly bridge for the Gravitas GR physics engine.
+//!
+//! This crate wraps `gravitas-core` and exposes it to JavaScript via wasm-bindgen.
+//! All physics computation is delegated to the core library.
+//! This crate only handles:
+//!   - SharedArrayBuffer (SAB) protocol
+//!   - Camera EKF (browser-specific input handling)
+//!   - WebGPU data layout structs
+#![allow(clippy::too_many_arguments)]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_mut)]
+#![allow(unused_variables)]
+
+mod camera;
+mod sab;
+
+use gravitas::geodesic::{
+    integrate, AdaptiveStepper, GeodesicState, IntegrationMethod, IntegrationOptions,
+};
+use gravitas::invariants;
+use gravitas::metric::kerr::CoordinateSystem;
+use gravitas::metric::{Kerr, Metric, Orbit};
+use gravitas::physics::{disk, spectrum};
+
+use js_sys::Float32Array;
+use wasm_bindgen::prelude::*;
+
+// Enable panic hook for better debugging
+#[wasm_bindgen]
+pub fn init_hooks() {
+    console_error_panic_hook::set_once();
+}
+
+// SAB f32-index offsets. Each `sab_ptr.add(N)` advances by N f32 units
+// (= N * 4 bytes). Block ownership: CONTROL and CAMERA are written by
+// the main thread (operator inputs, camera pose); PHYSICS, TELEMETRY,
+// and LUTS are written by this worker. Single-writer per block.
+pub const OFFSET_CONTROL: usize = 0;
+pub const OFFSET_CAMERA: usize = 64;
+pub const OFFSET_PHYSICS: usize = 128;
+pub const OFFSET_TELEMETRY: usize = 256;
+pub const OFFSET_LUTS: usize = 2048;
+
+// Shadow curve cap. PHYSICS spans f32 indices 128..256 (128 slots);
+// offsets 0..15 hold reserved scalars (horizon, ISCO, mass, spin,
+// min_a, max_a, point count). The remaining 112 slots fit 56 (x, y)
+// points before the writer would overflow into TELEMETRY.
+pub const SHADOW_CURVE_OFFSET_IN_PHYSICS: usize = 16;
+pub const SHADOW_CURVE_MAX_POINTS: usize = 56;
+pub const SHADOW_CURVE_FLOATS: usize = SHADOW_CURVE_MAX_POINTS * 2;
+const _SHADOW_CURVE_FITS: () = assert!(
+    SHADOW_CURVE_OFFSET_IN_PHYSICS + SHADOW_CURVE_FLOATS
+        <= OFFSET_TELEMETRY - OFFSET_PHYSICS,
+    "SHADOW_CURVE_FLOATS overflows PHYSICS block; reduce SHADOW_CURVE_MAX_POINTS",
+);
+
+#[wasm_bindgen]
+pub struct PhysicsEngine {
+    mass: f64,
+    spin: f64,
+    metric_bl: Kerr,
+    metric_ks: Kerr,
+    lut_width: usize,
+    lut_buffer: Vec<f32>,
+    sab_buffer: Vec<f32>,
+    external_sab_ptr: Option<*mut f32>,
+    camera: camera::CameraState,
+    last_good_camera: camera::CameraState,
+}
+
+#[wasm_bindgen]
+impl PhysicsEngine {
+    #[wasm_bindgen(constructor)]
+    pub fn new(mass: f64, spin: f64) -> PhysicsEngine {
+        PhysicsEngine {
+            mass,
+            spin,
+            metric_bl: Kerr::new(mass, spin),
+            metric_ks: Kerr::kerr_schild(mass, spin),
+            lut_width: 512,
+            lut_buffer: Vec::new(),
+            sab_buffer: vec![0.0; 2048],
+            external_sab_ptr: None,
+            camera: camera::CameraState::new(),
+            last_good_camera: camera::CameraState::new(),
+        }
+    }
+
+    /// Attach an external SharedArrayBuffer pointer.
+    ///
+    /// # Safety
+    ///
+    /// Caller must guarantee:
+    /// 1. `ptr` is non-null and 4-byte aligned (f32 alignment).
+    /// 2. `ptr` remains valid for the lifetime of this engine.
+    /// 3. The JS side never writes to the PHYSICS, TELEMETRY, or LUTS
+    ///    blocks while this engine is running.
+    ///
+    /// (1) is checked at runtime and produces an `Err`. (2) and (3) are
+    /// caller responsibility and cannot be checked here.
+    pub fn attach_sab(&mut self, ptr: *mut f32) -> Result<(), JsValue> {
+        if ptr.is_null() {
+            return Err(JsValue::from_str("attach_sab: null pointer"));
+        }
+        let addr = ptr as usize;
+        if !addr.is_multiple_of(4) {
+            return Err(JsValue::from_str(
+                "attach_sab: misaligned pointer (f32 requires 4-byte alignment)",
+            ));
+        }
+        self.external_sab_ptr = Some(ptr);
+        Ok(())
+    }
+
+    pub fn update_params(&mut self, mass: f64, spin: f64) {
+        self.mass = mass;
+        self.spin = spin;
+        self.metric_bl = Kerr::new(mass, spin);
+        self.metric_ks = Kerr::kerr_schild(mass, spin);
+    }
+
+    pub fn compute_horizon(&self) -> f64 {
+        self.metric_bl.event_horizon()
+    }
+
+    pub fn compute_isco(&self) -> f64 {
+        self.metric_bl.isco(Orbit::Prograde)
+    }
+
+    pub fn compute_photon_sphere(&self) -> f64 {
+        self.metric_bl.photon_sphere()
+    }
+
+    pub fn compute_dilation(&self, r: f64) -> f64 {
+        // Original behavior: returns dt_coord / dt_proper = 1 / sqrt(-g_tt)
+        let td = self.metric_bl.time_dilation(r, std::f64::consts::FRAC_PI_2);
+        if td <= 0.0 {
+            100.0 // Inside horizon / ergosphere cap
+        } else {
+            1.0 / td
+        }
+    }
+
+    pub fn generate_disk_lut(&mut self) -> Vec<f32> {
+        self.lut_buffer = disk::generate_temperature_lut(&self.metric_bl, self.lut_width);
+        self.lut_buffer.clone()
+    }
+
+    pub fn get_disk_lut_ptr(&self) -> *const f32 {
+        self.lut_buffer.as_ptr()
+    }
+
+    pub fn get_sab_ptr(&self) -> *const f32 {
+        self.sab_buffer.as_ptr()
+    }
+
+    pub fn set_camera_state(&mut self, px: f64, py: f64, pz: f64, _lx: f64, _ly: f64, _lz: f64) {
+        self.camera.position = glam::DVec3::new(px, py, pz);
+    }
+
+    pub fn set_auto_spin(&mut self, enabled: bool) {
+        self.camera.auto_spin = enabled;
+    }
+
+    pub fn generate_spectrum_lut(
+        &self,
+        width: usize,
+        height: usize,
+        max_temp: f64,
+    ) -> Float32Array {
+        let data = spectrum::generate_blackbody_lut(width, height, max_temp);
+        Float32Array::from(data.as_slice())
+    }
+
+    /// Spacetime visualization: embedding mesh for React Three Fiber
+    pub fn generate_embedding_mesh(
+        &self,
+        r_min: f64,
+        r_max: f64,
+        n_radial: usize,
+        n_angular: usize,
+    ) -> Float32Array {
+        let data = gravitas::spacetime::embedding::embedding_mesh(
+            self.mass, self.spin, r_min, r_max, n_radial, n_angular,
+        );
+        Float32Array::from(data.as_slice())
+    }
+
+    /// Spacetime visualization: ergosphere mesh
+    pub fn generate_ergosphere_mesh(&self, n_polar: usize, n_azimuthal: usize) -> Float32Array {
+        let data =
+            gravitas::spacetime::frame_drag::ergosphere_mesh(&self.metric_bl, n_polar, n_azimuthal);
+        Float32Array::from(data.as_slice())
+    }
+
+    /// Bardeen critical curve: exact shadow boundary for spinning BH.
+    /// Returns flat array of [alpha0, beta0, alpha1, beta1, ...] pairs.
+    pub fn compute_shadow_curve(&self, theta_obs: f64, n_points: usize) -> Float32Array {
+        let points =
+            gravitas::physics::shadow::bardeen_shadow(&self.metric_bl, theta_obs, n_points);
+        let flat: Vec<f32> = points
+            .iter()
+            .flat_map(|(a, b)| vec![*a as f32, *b as f32])
+            .collect();
+        Float32Array::from(flat.as_slice())
+    }
+
+    /// Schwarzschild shadow radius (critical impact parameter).
+    pub fn compute_shadow_radius(&self) -> f64 {
+        gravitas::physics::shadow::schwarzschild_shadow_radius(self.mass)
+    }
+
+    /// Returns the [min_alpha, max_alpha] horizontal extents of the shadow.
+    /// This is used to drive the D-shape flattening in the shader.
+    pub fn compute_shadow_shift(&self, theta_obs: f64) -> Vec<f32> {
+        let curve = gravitas::physics::shadow::bardeen_shadow(&self.metric_bl, theta_obs, 32);
+        let mut min_a = 0.0;
+        let mut max_a = 0.0;
+        if !curve.is_empty() {
+            min_a = curve[0].0;
+            max_a = curve[0].0;
+            for (a, _) in curve {
+                if a < min_a {
+                    min_a = a;
+                }
+                if a > max_a {
+                    max_a = a;
+                }
+            }
+        }
+        vec![min_a as f32, max_a as f32]
+    }
+
+    /// Page-Thorne flux at radius r (full GR disk flux function).
+    pub fn compute_disk_flux(&self, r: f64) -> f64 {
+        gravitas::physics::disk::page_thorne_flux(r, &self.metric_bl, 1.0)
+    }
+
+    /// Full GR g-factor for disk emission at radius r with impact parameter lambda.
+    pub fn compute_g_factor(&self, r: f64, lambda: f64) -> f64 {
+        gravitas::physics::redshift::kerr_g_factor(r, self.mass, self.spin, lambda)
+    }
+
+    // =================================================================
+    // SP-4 / SP-5 physics primitives exposed to JavaScript.
+    // =================================================================
+
+    /// Hawking temperature T_H (Kelvin) for the current mass + spin
+    /// at the supplied SI rest mass. The structural Kerr correction
+    /// uses the dimensionless spin a*; mass is supplied separately
+    /// because the WASM PhysicsEngine carries dimensionless mass for
+    /// the imaging side and SI mass is only meaningful for the
+    /// quantum-readout panel.
+    pub fn hawking_temperature_kelvin(&self, mass_kg: f64) -> f64 {
+        gravitas::quantum::hawking::hawking_temperature(mass_kg, self.spin)
+    }
+
+    /// Wien peak frequency (Hz) for a Planck-shape Hawking spectrum
+    /// at the given temperature.
+    pub fn wien_peak_hz(&self, temperature_k: f64) -> f64 {
+        gravitas::quantum::hawking::wien_peak_frequency(temperature_k)
+    }
+
+    /// Planck-shape Hawking spectrum sample (W·m⁻²·Hz⁻¹·sr⁻¹). The
+    /// readout panel labels this "illustrative"; no greybody factor.
+    pub fn hawking_spectrum_sample(&self, freq_hz: f64, temperature_k: f64) -> f64 {
+        gravitas::quantum::hawking::hawking_spectrum_planck(freq_hz, temperature_k)
+    }
+
+    /// Outer-horizon area in geometric units (M = 1).
+    pub fn horizon_area_geometric(&self) -> f64 {
+        gravitas::quantum::bekenstein::horizon_area_geometric(&self.metric_bl)
+    }
+
+    /// Bekenstein-Hawking dimensionless entropy S/k_B for the current
+    /// hole at the supplied SI mass.
+    pub fn bekenstein_hawking_entropy_ratio(&self, mass_kg: f64) -> f64 {
+        gravitas::quantum::bekenstein::bekenstein_hawking_entropy_per_kb(
+            &self.metric_bl,
+            mass_kg,
+        )
+    }
+
+    /// Page 1976 photon-only Schwarzschild evaporation lifetime in
+    /// seconds. The formula is spin-independent at leading order;
+    /// callers wanting the spin correction multiply the result by a
+    /// per-spin factor from Page 1976 Table 1 (currently TBD here;
+    /// the panel is illustrative).
+    pub fn schwarzschild_evaporation_time_seconds(&self, mass_kg: f64) -> f64 {
+        gravitas::quantum::bekenstein::schwarzschild_evaporation_time(mass_kg)
+    }
+
+    /// Radiative efficiency η = 1 − E_ISCO for the prograde ISCO.
+    /// Reproduces the Schwarzschild 5.72 % and Thorne 32 % limits.
+    pub fn radiative_efficiency_prograde(&self) -> f64 {
+        gravitas::physics::plunge::radiative_efficiency(
+            &self.metric_bl,
+            gravitas::metric::Orbit::Prograde,
+        )
+    }
+
+    /// Wald 1974 horizon charge q_W = 2 B_0 a M induced by spin
+    /// dragging the supplied uniform asymptotic field through the
+    /// horizon. B_0 is in geometric units (the panel converts).
+    pub fn wald_horizon_charge(&self, b0: f64) -> f64 {
+        gravitas::physics::magnetosphere::wald_horizon_charge(&self.metric_bl, b0)
+    }
+
+    /// Asymptotic Bz recovered from the Wald A_φ at far radius.
+    /// Used for renderer normalisation when streamlines land in a
+    /// follow-up.
+    pub fn wald_asymptotic_b_z(&self, b0: f64, r: f64, theta: f64) -> f64 {
+        let a_mu = gravitas::physics::magnetosphere::wald_potential_down(
+            &self.metric_bl,
+            b0,
+            r,
+            theta,
+        );
+        gravitas::physics::magnetosphere::asymptotic_b_z_from_potential(r, theta, a_mu[3])
+    }
+
+    /// Pandya+ 2016 thermal synchrotron emissivity j_ν (CGS). Caller
+    /// supplies the plasma state; the radiative-transfer integration
+    /// path is currently composed JS-side.
+    pub fn synchrotron_emissivity(
+        &self,
+        freq_hz: f64,
+        n_e_cm3: f64,
+        t_e_kelvin: f64,
+        b_gauss: f64,
+        theta_b_rad: f64,
+    ) -> f64 {
+        let plasma = gravitas::physics::synchrotron::PlasmaState {
+            n_e: n_e_cm3,
+            t_e: t_e_kelvin,
+            b_field: b_gauss,
+            theta_b: theta_b_rad,
+        };
+        gravitas::physics::synchrotron::j_thermal_synchrotron(freq_hz, plasma)
+    }
+
+    /// Pandya+ 2016 thermal synchrotron absorption coefficient α_ν
+    /// (CGS cm⁻¹) via Kirchhoff's law in the thermal limit.
+    pub fn synchrotron_absorption(
+        &self,
+        freq_hz: f64,
+        n_e_cm3: f64,
+        t_e_kelvin: f64,
+        b_gauss: f64,
+        theta_b_rad: f64,
+    ) -> f64 {
+        let plasma = gravitas::physics::synchrotron::PlasmaState {
+            n_e: n_e_cm3,
+            t_e: t_e_kelvin,
+            b_field: b_gauss,
+            theta_b: theta_b_rad,
+        };
+        gravitas::physics::synchrotron::alpha_thermal_synchrotron(freq_hz, plasma)
+    }
+
+    // =================================================================
+    // SPACETIME VISUALIZATION: curvature.rs, lightcone.rs, frame_drag.rs,
+    // embedding.rs -- now exposed to JavaScript for 3D grid rendering.
+    // =================================================================
+
+    /// FROM curvature.rs: Kretschner scalar at a point.
+    /// K = R_{abcd} R^{abcd} -- coordinate-invariant tidal force measure.
+    pub fn compute_kretschner(&self, r: f64, theta: f64) -> f64 {
+        gravitas::spacetime::curvature::kretschner_kerr(r, theta, self.mass, self.spin)
+    }
+
+    /// FROM curvature.rs: Generate a 2D scalar field of curvature values.
+    /// Returns flat array of (r, theta, K) triples.
+    pub fn generate_curvature_field(
+        &self,
+        r_min: f64,
+        r_max: f64,
+        n_radial: usize,
+        n_polar: usize,
+    ) -> Float32Array {
+        let field = gravitas::spacetime::curvature::curvature_field(
+            self.mass, self.spin, r_min, r_max, n_radial, n_polar,
+        );
+        let flat: Vec<f32> = field
+            .iter()
+            .flat_map(|(r, t, k)| vec![*r as f32, *t as f32, *k as f32])
+            .collect();
+        Float32Array::from(flat.as_slice())
+    }
+
+    /// FROM lightcone.rs: Light cone tilt angle at (r, theta).
+    /// Uses the full covariant metric: tan(alpha) = sqrt(-g_tt / g_rr).
+    pub fn compute_light_cone_tilt(&self, r: f64, theta: f64) -> f64 {
+        gravitas::spacetime::lightcone::light_cone_tilt(&self.metric_bl, r, theta)
+    }
+
+    /// FROM lightcone.rs: Generate a 2D field of tilt angles.
+    /// Returns flat array of (r, theta, tilt_angle) triples.
+    pub fn generate_tilt_field(
+        &self,
+        r_min: f64,
+        r_max: f64,
+        n_radial: usize,
+        n_polar: usize,
+    ) -> Float32Array {
+        let field = gravitas::spacetime::lightcone::tilt_field(
+            &self.metric_bl,
+            r_min,
+            r_max,
+            n_radial,
+            n_polar,
+        );
+        let flat: Vec<f32> = field
+            .iter()
+            .flat_map(|(r, t, a)| vec![*r as f32, *t as f32, *a as f32])
+            .collect();
+        Float32Array::from(flat.as_slice())
+    }
+
+    /// FROM frame_drag.rs: Frame-dragging angular velocity at (r, theta).
+    /// omega = -g_{t phi} / g_{phi phi} (ZAMO angular velocity).
+    pub fn compute_frame_drag_omega(&self, r: f64, theta: f64) -> f64 {
+        gravitas::spacetime::frame_drag::frame_dragging_omega(&self.metric_bl, r, theta)
+    }
+
+    /// FROM frame_drag.rs: Generate a 2D vector field of frame dragging.
+    /// Returns flat array of (r, theta, omega) triples.
+    pub fn generate_frame_drag_field(
+        &self,
+        r_min: f64,
+        r_max: f64,
+        n_radial: usize,
+        n_polar: usize,
+    ) -> Float32Array {
+        let field = gravitas::spacetime::frame_drag::frame_drag_field(
+            &self.metric_bl,
+            r_min,
+            r_max,
+            n_radial,
+            n_polar,
+        );
+        let flat: Vec<f32> = field
+            .iter()
+            .flat_map(|(r, t, o)| vec![*r as f32, *t as f32, *o as f32])
+            .collect();
+        Float32Array::from(flat.as_slice())
+    }
+
+    /// FROM embedding.rs: Flamm's paraboloid height at radius r.
+    /// z = 2 * sqrt(rs * (r - rs))  for Schwarzschild.
+    pub fn compute_flamm_height(&self, r: f64) -> f64 {
+        gravitas::spacetime::embedding::flamm_height(r, self.mass)
+    }
+
+    /// FROM embedding.rs: Proper radial distance between r1 and r2.
+    /// Integrates sqrt(g_rr) dr using the actual metric tensor.
+    pub fn compute_proper_distance(&self, r1: f64, r2: f64, n_steps: usize) -> f64 {
+        gravitas::spacetime::embedding::proper_distance(&self.metric_bl, r1, r2, n_steps)
+    }
+
+    /// SAB tick: reads inputs, updates camera, writes outputs.
+    pub fn tick_sab(&mut self, dt_override: f64) {
+        let sab_ptr = if let Some(ext_ptr) = self.external_sab_ptr {
+            ext_ptr
+        } else {
+            self.sab_buffer.as_mut_ptr()
+        };
+
+        // SAFETY: sab_ptr is non-null, 4-byte aligned, and stays valid
+        // for the duration of this tick. Either it came from `attach_sab`
+        // (validated at attach time) or it points into our own
+        // `sab_buffer: Vec<f32>` (always non-null and aligned by Rust
+        // ownership). The PHYSICS, TELEMETRY, and LUTS blocks have a
+        // single writer (this worker); the JS bridge guarantees that
+        // contract. Offset arithmetic stays in-bounds by construction:
+        // OFFSET_* constants plus SHADOW_CURVE_MAX_POINTS bound the
+        // address range below the SAB allocation size.
+        unsafe {
+            // 1. READ INPUTS
+            let mouse_dx = *sab_ptr.add(OFFSET_CONTROL + 1) as f64;
+            let mouse_dy = *sab_ptr.add(OFFSET_CONTROL + 2) as f64;
+            let zoom_delta = *sab_ptr.add(OFFSET_CONTROL + 3) as f64;
+            let dt = if dt_override > 0.0 {
+                dt_override
+            } else {
+                *sab_ptr.add(OFFSET_CONTROL + 4) as f64
+            };
+
+            // Consume-on-read: main writes mouse/zoom deltas into
+            // CONTROL[1..3]; we zero them after reading. There is a small
+            // race window if main writes between our read and clear, but
+            // at 60-75 Hz pointer events the worst case is one frame of
+            // dropped input.
+            *sab_ptr.add(OFFSET_CONTROL + 1) = 0.0;
+            *sab_ptr.add(OFFSET_CONTROL + 2) = 0.0;
+            *sab_ptr.add(OFFSET_CONTROL + 3) = 0.0;
+
+            // 2. UPDATE CAMERA
+            let input = camera::CameraInput {
+                mouse_dx,
+                mouse_dy,
+                zoom_delta,
+                dt,
+            };
+            camera::update_camera(&input, &mut self.camera);
+
+            if !self.camera.validate() {
+                self.camera = self.last_good_camera;
+            } else {
+                self.last_good_camera = self.camera;
+            }
+
+            // 3. WRITE CAMERA STATE
+            *sab_ptr.add(OFFSET_CAMERA) = self.camera.position.x as f32;
+            *sab_ptr.add(OFFSET_CAMERA + 1) = self.camera.position.y as f32;
+            *sab_ptr.add(OFFSET_CAMERA + 2) = self.camera.position.z as f32;
+
+            *sab_ptr.add(OFFSET_CAMERA + 4) = self.camera.velocity.x as f32;
+            *sab_ptr.add(OFFSET_CAMERA + 5) = self.camera.velocity.y as f32;
+            *sab_ptr.add(OFFSET_CAMERA + 6) = self.camera.velocity.z as f32;
+
+            *sab_ptr.add(OFFSET_CAMERA + 8) = self.camera.orientation.x as f32;
+            *sab_ptr.add(OFFSET_CAMERA + 9) = self.camera.orientation.y as f32;
+            *sab_ptr.add(OFFSET_CAMERA + 10) = self.camera.orientation.z as f32;
+            *sab_ptr.add(OFFSET_CAMERA + 11) = self.camera.orientation.w as f32;
+
+            // 4. WRITE PHYSICS (computed via gravitas-core)
+            *sab_ptr.add(OFFSET_PHYSICS) = self.compute_horizon() as f32;
+            *sab_ptr.add(OFFSET_PHYSICS + 1) = self.compute_isco() as f32;
+            *sab_ptr.add(OFFSET_PHYSICS + 2) = self.mass as f32;
+            *sab_ptr.add(OFFSET_PHYSICS + 3) = self.spin as f32;
+
+            // 4.1 SHADOW SHIFT: Calculate inclination theta_obs
+            let r_cam = self.camera.position.length();
+            if r_cam > 0.0 {
+                let cos_theta = self.camera.position.y / r_cam;
+                let theta_obs = cos_theta.acos(); // [0, PI]
+                let curve =
+                    gravitas::physics::shadow::bardeen_shadow(&self.metric_bl, theta_obs, 32);
+
+                // Clear the curve region so old frames don't leave ghost
+                // segments. The bound stays inside PHYSICS.
+                for i in 0..SHADOW_CURVE_FLOATS {
+                    *sab_ptr.add(OFFSET_PHYSICS + SHADOW_CURVE_OFFSET_IN_PHYSICS + i) = 0.0;
+                }
+
+                // Write up to SHADOW_CURVE_MAX_POINTS points; truncate the rest.
+                let actual_points = curve.len().min(SHADOW_CURVE_MAX_POINTS);
+                *sab_ptr.add(OFFSET_PHYSICS + 15) = actual_points as f32;
+
+                for (i, (a, b)) in curve.iter().take(actual_points).enumerate() {
+                    let slot = OFFSET_PHYSICS + SHADOW_CURVE_OFFSET_IN_PHYSICS + i * 2;
+                    debug_assert!(
+                        slot + 1 < OFFSET_TELEMETRY,
+                        "shadow curve write at slot {} would overflow into TELEMETRY ({})",
+                        slot,
+                        OFFSET_TELEMETRY,
+                    );
+                    *sab_ptr.add(slot) = *a as f32;
+                    *sab_ptr.add(slot + 1) = *b as f32;
+                }
+
+                // Extents for fast bounding box checks
+                let mut min_a = 0.0;
+                let mut max_a = 0.0;
+                if !curve.is_empty() {
+                    min_a = curve[0].0;
+                    max_a = curve[0].0;
+                    for (a_val, _) in &curve {
+                        if *a_val < min_a {
+                            min_a = *a_val;
+                        }
+                        if *a_val > max_a {
+                            max_a = *a_val;
+                        }
+                    }
+                }
+                *sab_ptr.add(OFFSET_PHYSICS + 4) = min_a as f32;
+                *sab_ptr.add(OFFSET_PHYSICS + 5) = max_a as f32;
+            }
+
+            // 5. UPDATE SEQUENCE
+            *sab_ptr.add(OFFSET_TELEMETRY) += 1.0;
+        }
+    }
+
+    pub fn get_sab_layout(&self) -> Vec<usize> {
+        vec![
+            OFFSET_CONTROL,
+            OFFSET_CAMERA,
+            OFFSET_PHYSICS,
+            OFFSET_TELEMETRY,
+            OFFSET_LUTS,
+        ]
+    }
+
+    /// High-precision geodesic integration (delegates to gravitas-core).
+    ///
+    /// Returns an `Err` if `initial_state` is not exactly 8 elements
+    /// (4-vector position followed by 4-vector covariant momentum) or
+    /// if `tolerance` is non-positive. Surfaces as a JS exception that
+    /// the caller can catch; previously returned the malformed input
+    /// silently which masked configuration mistakes.
+    pub fn integrate_ray_relativistic(
+        &self,
+        initial_state: Vec<f64>,
+        steps: usize,
+        tolerance: f64,
+        use_kerr_schild: bool,
+    ) -> Result<Vec<f64>, JsValue> {
+        if initial_state.len() != 8 {
+            return Err(JsValue::from_str(&format!(
+                "integrate_ray_relativistic: initial_state must be 8 elements (got {})",
+                initial_state.len()
+            )));
+        }
+        if !(tolerance > 0.0 && tolerance.is_finite()) {
+            return Err(JsValue::from_str(
+                "integrate_ray_relativistic: tolerance must be positive and finite",
+            ));
+        }
+
+        let state = GeodesicState::new(
+            initial_state[0],
+            initial_state[1],
+            initial_state[2],
+            initial_state[3],
+            initial_state[4],
+            initial_state[5],
+            initial_state[6],
+            initial_state[7],
+        );
+
+        let options = IntegrationOptions {
+            method: IntegrationMethod::AdaptiveRKF45,
+            tolerance,
+            initial_step: 0.01,
+            max_steps: steps,
+            escape_radius: 1000.0,
+            renormalize_interval: 10,
+            record_path: false,
+            geodesic_kind: gravitas::geodesic::GeodesicKind::Null,
+        };
+
+        let trajectory = if use_kerr_schild {
+            integrate(&state, &self.metric_ks, &options)
+        } else {
+            integrate(&state, &self.metric_bl, &options)
+        };
+
+        let s = trajectory.final_state;
+        Ok(vec![
+            s.x[0], s.x[1], s.x[2], s.x[3], s.p[0], s.p[1], s.p[2], s.p[3],
+        ])
+    }
+}

@@ -1,0 +1,3 @@
+[workspace]
+members = ["gravitas-core", "gravitas-wasm"]
+resolver = "2"

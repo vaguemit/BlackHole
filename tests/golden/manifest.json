@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "viewport": { "width": 1280, "height": 720 },
+  "stabilization_frames": 8,
+  "frames": [
+    {
+      "name": "schwarzschild_face_on",
+      "config": { "mass": 1.0, "spin": 0.0, "zoom": 20.0, "diskTemp": 0.0 },
+      "ssim_threshold": 0.998,
+      "max_pixel_delta": 12,
+      "captured_at": null,
+      "captured_commit": null
+    },
+    {
+      "name": "kerr_inclined",
+      "config": { "mass": 1.0, "spin": 0.5, "zoom": 20.0, "diskTemp": 1.0 },
+      "ssim_threshold": 0.997,
+      "max_pixel_delta": 16,
+      "captured_at": null,
+      "captured_commit": null
+    },
+    {
+      "name": "near_extremal_edge_on",
+      "config": { "mass": 1.0, "spin": 0.99, "zoom": 20.0, "diskTemp": 1.0 },
+      "ssim_threshold": 0.996,
+      "max_pixel_delta": 20,
+      "captured_at": null,
+      "captured_commit": null
+    }
+  ]
+}
